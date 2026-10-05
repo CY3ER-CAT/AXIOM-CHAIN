@@ -1,4 +1,4 @@
-# AXIOM CHAIN
+# PROXY CHAIN
 
 **Multi-hop Tor proxy chain with a live home-screen menu — by CY3ER-CAT**
 
