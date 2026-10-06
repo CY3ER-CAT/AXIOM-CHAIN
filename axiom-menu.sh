@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # axiom-menu.sh — home screen for the axiom multi-hop stack
 # auto-engages on open, full stop on close
+# macOS + Linux port.
 set -uo pipefail
 
 BASE="$HOME/.axiom"
+# shellcheck source=axiom-lib.sh
+source "$BASE/axiom-lib.sh"
+
 DRV="$BASE/axiom-multihop.sh"
-CHAIN="$BASE/proxychains4.conf"
 PIDF="$BASE/rotator.pid"
 OWNERF="$BASE/rotator.owner"
-TORF="$BASE/tor.session"
 IPF="$BASE/ip.cache"
 ROTATE_INTERVAL="${AXIOM_ROTATE:-300}"
 export AXIOM_IN_MENU=1
@@ -16,18 +18,30 @@ export AXIOM_IN_MENU=1
 C_Y=$'\e[33m'; C_G=$'\e[32m'; C_R=$'\e[31m'
 C_C=$'\e[36m'; C_M=$'\e[35m'; C_B=$'\e[1m'; C_D=$'\e[2m'; R=$'\e[0m'
 
-tor_pid()      { pgrep -x tor 2>/dev/null | head -1; }
-rotator_pid()  { [[ -f "$PIDF" ]] && cat "$PIDF" || echo ""; }
+rotator_pid() { [[ -f "$PIDF" ]] && cat "$PIDF" || echo ""; }
 
 rotator_live() {
     local p; p=$(rotator_pid)
-    [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+    [[ -n "$p" ]] && axiom_pid_alive "$p"
 }
 
 tor_state() {
-    local p; p=$(tor_pid)
-    if [[ -n "$p" ]]; then printf '%sRUNNING%s (pid %s)' "$C_G" "$R" "$p"
+    if [[ -n "$(tor_pid)" ]]; then printf '%sRUNNING%s (pid %s)' "$C_G" "$R" "$(tor_pid)"
     else printf '%sSTOPPED%s' "$C_R" "$R"; fi
+}
+
+tor_pid() {
+    # our dedicated Tor only — identified by DataDirectory / SOCKS port, never a
+    # foreign daemon the user started themselves
+    local p
+    p=$(axiom_tor_pid 2>/dev/null) && { echo "$p"; return 0; }
+    # fall back to a live SOCKS port probe
+    local socks; socks=$(axiom_socks_port)
+    if curl -s --max-time 4 --socks5-hostname "127.0.0.1:$socks" \
+        https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+        echo "port:$socks"; return 0
+    fi
+    return 1
 }
 
 rotator_state() {
@@ -36,57 +50,37 @@ rotator_state() {
     else printf '%sOFF%s' "$C_R" "$R"; fi
 }
 
-vpn_state() {
-    local iface ip
-    for iface in "${AXIOM_VPN_IF:-}" tun0 tun1 wg0 ppp0; do
-        [[ -z "$iface" ]] && continue
-        if ip link show "$iface" >/dev/null 2>&1; then
-            ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
-            printf '%sUP%s (%s: %s)' "$C_G" "$R" "$iface" "${ip:-?}"
-            return
-        fi
-    done
-    printf '%sDOWN%s (tor-only)' "$C_D" "$R"
-}
-
-chain_state() {
-    if rotator_live && [[ -n "$(tor_pid)" ]]; then
-        printf '%sON%s' "$C_G" "$R"
-    else
-        printf '%sOFF%s' "$C_R" "$R"
-    fi
-}
-
-tor_state_plain()   { printf 'RUNNING (pid %s)' "$(tor_pid)"; }
-rotator_state_plain(){ printf 'ACTIVE (pid %s, rotate every %ss)' "$(rotator_pid)" "$ROTATE_INTERVAL"; }
-
-vpn_iface() {
-    local iface
-    for iface in "${AXIOM_VPN_IF:-}" tun0 tun1 wg0 ppp0; do
-        [[ -z "$iface" ]] && continue
-        ip link show "$iface" >/dev/null 2>&1 && { echo "$iface"; return; }
-    done
-    return 1
-}
-
-vpn_up() { vpn_iface >/dev/null 2>&1; }
+vpn_up() { [[ -n "$(axiom_vpn_iface 2>/dev/null)" ]]; }
 
 vpn_state_plain() {
     local iface ip
-    iface=$(vpn_iface) || return 1
-    ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
+    iface=$(axiom_vpn_iface) || return 1
+    ip=$(iface_ipv4 "$iface")
     printf 'UP (%s: %s)' "$iface" "${ip:-?}"
 }
 
+proxy_mode_label() {
+    case "$(axiom_proxy_mode)" in
+        kernel) printf '✅ kernel (proxychains4 hook)' ;;
+        *)      printf '⚠️  per-tool (SOCKS env only)' ;;
+    esac
+}
+
+chain_state() {
+    if rotator_live && [[ -n "$(tor_pid)" ]]; then printf '%sON%s' "$C_G" "$R"
+    else printf '%sOFF%s' "$C_R" "$R"; fi
+}
+
 refresh_ips() {
-    local real="" exit_="" u
+    local real="" exit_="" u socks
+    socks=$(axiom_socks_port)
     for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
         real=$(curl -s --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
         [[ "$real" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
         real=""
     done
     for u in https://api.ipify.org https://ifconfig.me/ip https://check.torproject.org/api/ip; do
-        exit_=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 "$u" 2>/dev/null || true)
+        exit_=$(curl -s --max-time 20 --socks5-hostname "127.0.0.1:$socks" "$u" 2>/dev/null || true)
         if [[ "$u" == *check.torproject* ]]; then
             exit_=$(printf '%s' "$exit_" | sed -n 's/.*"IP"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
         fi
@@ -113,8 +107,6 @@ ip_field() { [[ -f "$IPF" ]] && cut -d'|' -f"$1" "$IPF" || echo "?"; }
 
 engage() {
     if rotator_live && [[ -n "$(tor_pid)" ]]; then
-        # chain already live — make sure close=off can still find our tor
-        [[ -f "$TORF" ]] || tor_pid > "$TORF" 2>/dev/null || true
         return 0
     fi
     printf '  %s[*]%s engaging chain — tor boot + leak gate...\n' "$C_Y" "$R"
@@ -130,7 +122,6 @@ engage() {
         printf '  %s[*]%s gate hiccup — retrying (%s/3)...\n' "$C_Y" "$R" "$((attempt + 1))"
         sleep 3
     done
-    tor_pid > "$TORF" 2>/dev/null || true
     AXIOM_ROTATE="$ROTATE_INTERVAL" "$DRV" watch >> "$BASE/stack.log" 2>&1 &
     echo $! > "$PIDF"
     echo $$ > "$OWNERF"
@@ -144,27 +135,21 @@ disengage() {
     p=$(rotator_pid)
     own=""
     [[ -f "$OWNERF" ]] && own=$(cat "$OWNERF" 2>/dev/null)
-    if [[ -n "$own" && "$own" != "$$" ]] && kill -0 "$own" 2>/dev/null; then
+    if [[ -n "$own" && "$own" != "$$" ]] && axiom_pid_alive "$own" 2>/dev/null; then
         printf '  %s[i]%s chain stays ON — owned by another window (pid %s)\n' "$C_C" "$R" "$own"
         return 0
     fi
     if [[ -n "$p" ]]; then
-        pkill -TERM -P "$p" 2>/dev/null || true
-        kill -TERM "$p" 2>/dev/null || true
+        axiom_kill_tree "$p" TERM
         for i in 1 2 3 4 5 6 7 8; do
-            kill -0 "$p" 2>/dev/null || break
+            axiom_pid_alive "$p" 2>/dev/null || break
             sleep 0.25
         done
-        if kill -0 "$p" 2>/dev/null; then
-            pkill -KILL -P "$p" 2>/dev/null || true
-            kill -KILL "$p" 2>/dev/null || true
-        fi
+        axiom_pid_alive "$p" 2>/dev/null && axiom_kill_tree "$p" KILL
         rm -f "$PIDF" "$OWNERF"
     fi
-    if [[ -f "$TORF" ]]; then
-        kill -TERM "$(cat "$TORF" 2>/dev/null)" 2>/dev/null || true
-        rm -f "$TORF"
-    fi
+    "$DRV" stop >/dev/null 2>&1 || true
+    rm -f "$AXIOM_PORTS_FILE"
     printf '  %s[-]%s chain OFF — nothing routed, everything closed.\n' "$C_R" "$R"
 }
 
@@ -181,24 +166,27 @@ BANNER
     printf '%s' "$R"
     printf '  %s── SYSTEM STATUS ────────────────────────────────────────────%s\n' "$C_D" "$R"
     if [[ "$(rotator_pid)" != "" ]] && rotator_live && [[ -n "$(tor_pid)" ]]; then
-        printf '  %-14s: ✅ ON\n' "Chain"
+        printf '  %-14s: ✅ ON (socks %s / ctrl %s)\n' "Chain" "$(axiom_socks_port)" "$(axiom_ctrl_port)"
     else
         printf '  %-14s: ❌ OFF\n' "Chain"
     fi
     if [[ -n "$(tor_pid)" ]]; then
-        printf '  %-14s: ✅ %s\n' "Tor daemon" "$(tor_state_plain)"
+        printf '  %-14s: ✅ RUNNING\n' "Tor daemon"
     else
         printf '  %-14s: ❌ STOPPED\n' "Tor daemon"
     fi
     if rotator_live; then
-        printf '  %-14s: ✅ %s\n' "Rotator" "$(rotator_state_plain)"
+        printf '  %-14s: ✅ ACTIVE (pid %s, every %ss)\n' "Rotator" "$(rotator_pid)" "$ROTATE_INTERVAL"
     else
         printf '  %-14s: ❌ OFF\n' "Rotator"
     fi
+    printf '  %-14s: %s\n' "Proxy mode" "$(proxy_mode_label)"
     if vpn_up; then
         printf '  %-14s: ✅ %s\n' "VPN" "$(vpn_state_plain)"
+    elif axiom_vpn_supported; then
+        printf '  %-14s: ❌ no iface (tor-only)\n' "VPN"
     else
-        printf '  %-14s: ❌ no iface in VM (host VPN? see Egress line)\n' "VPN"
+        printf '  %-14s: – n/a on Windows (tor-only)\n' "VPN"
     fi
     if [[ "$(ip_field 1)" != "?" && -n "$(ip_field 1)" ]]; then
         printf '  %-14s: ✅ %s\n' "Real IP" "$(ip_field 1)"
@@ -235,6 +223,9 @@ BANNER
 main() {
     if engage; then
         draw
+        if [[ "$(axiom_proxy_mode)" != kernel ]]; then
+            printf '  %s[!]%s proxy mode = per-tool SOCKS env. Not every binary will route through Tor.\n' "$C_Y" "$R"
+        fi
         printf '  %s▶ auto: chained shell starting — type %sexit%s to come back here%s\n' \
             "$C_G" "$C_B" "$C_G" "$R"
         "$DRV" shell || true
@@ -258,7 +249,7 @@ main() {
             7) read -rp "  rotation seconds: " ROTATE_INTERVAL
                ROTATE_INTERVAL="${ROTATE_INTERVAL:-300}"
                if rotator_live; then
-                   kill -TERM "$(rotator_pid)" 2>/dev/null || true
+                   axiom_kill "$(rotator_pid)" TERM
                    rm -f "$PIDF"
                    engage
                fi ;;
