@@ -48,8 +48,11 @@ AXIOM CHAIN flips that:
   | Chain exit | current exit-node IP as seen through the chain |
   | Leak check | real IP ≠ exit IP? verdict recomputed live |
 
-- **Leak gate** — engage aborts if your real IP ever matches the exit IP
-- **Auto-rotation** — fresh Tor circuit every N seconds (default 300), each hop re-verified
+- **Leak gate** — engage aborts if your real IP ever matches the exit IP (verdicts:
+  `CLEAN` / `BUSTED` / `UNKNOWN` — a network flake reports UNKNOWN, never a fake CLEAN)
+- **Auto-rotation** — fresh Tor circuit every N seconds (default 300); every rotation
+  is **verified** (control port must answer `250`) and the new exit re-checked.
+  Failures are loud, and a flaky network warns instead of killing the rotator
 - **Close = off** — quit the menu and every process dies clean (TERM, wait, KILL fallback)
 - **Multi-window safe** — ownership lock: a second menu window can't kill the chain
   another window owns (each rotator records its owning PID)
@@ -137,9 +140,13 @@ Menu options:
 1. Spawn a dedicated Tor instance (own SocksPort/DataDirectory — never touches
    an already-running system Tor)
 2. Wait for the circuit, then probe: real IP (direct) vs exit IP (through chain)
-3. **Leak gate** — retry-backed (3 attempts, because transient `curl` timeouts must
-   not abort the chain). Real IP == exit IP → engage FAILS, everything rolled back
-4. Start the rotator watch loop: every N seconds → new circuit → re-verify → log
+3. **Leak gate** — retry-backed with fallback IP services (3 attempts, because
+   transient `curl` timeouts must not abort the chain). Three outcomes:
+   `CLEAN` (verified) / `BUSTED` (real == exit → engage FAILS, rolled back) /
+   `UNKNOWN` (couldn't verify → engage FAILS, never fake-green)
+4. Start the rotator watch loop: every N seconds → NEWNYM (control port must
+   answer `250`, else it's logged loudly) → leak gate re-run. A confirmed leak
+   kills the rotator; a network flake only warns and waits for the next cycle
 5. Status board renders; auto-shell launches chained
 
 **Disengage sequence:** SIGTERM the rotator (and its children) → wait up to 2s →
@@ -152,9 +159,31 @@ print `chain OFF`.
 |---|---|
 | `axiom-multihop.sh` | chain driver: boot Tor, leak gate, rotate, run commands, watch loop |
 | `axiom-menu.sh` | home screen: banner, status board, auto-shell, lifecycle + ownership |
-| `proxychains4.conf` | `strict_chain`, `proxy_dns`, `remote_dns_domain`, chain length, `[ProxyList]` |
+| `proxychains4.conf` | `strict_chain`, `proxy_dns`, `remote_dns_subnet`, `[ProxyList]` |
 | `install.sh` | deps check, copy to `~/.axiom`, rc wiring, desktop shortcut |
 | `axiom-run` (via menu 6) | one-shot command through the chain |
+
+## What this does NOT do
+
+Be honest with yourself before you trust any anonymizer — including this one:
+
+- **New circuit ≠ new identity.** Rotation changes your *route*, not *you*.
+  A site still knows you by your login, cookies, and browser fingerprint no
+  matter how many times the exit IP flips.
+- **TCP only.** `proxychains` hooks TCP — UDP and ping **bypass** the chain.
+  Don't run `nmap -sU` or `ping` while believing you're hidden.
+- **The human layer is yours.** Reused usernames, personal account logins,
+  writing style, time-of-day habits — no proxy fixes those. Log into Gmail
+  through the chain and you've stapled your identity to it.
+- **Browser not included.** This tunnels connections; it does not normalize
+  your fingerprint. Pair with **Tor Browser** for anything that matters.
+- **VPN hop is optional and off by default.** Unless a host VPN interface is
+  up, the chain is plain Tor (3 relays inside — guard/middle/exit).
+- **Timing/volume correlation** (nation-state tier) is not defeated by any
+  5-minute rotation.
+
+> **New route ≠ new identity.** This tool hardens the IP layer; accounts,
+> browser, and behavior are the other half — and they're on you.
 
 ## Config
 
@@ -169,7 +198,10 @@ print `chain OFF`.
 | Symptom | Cause / fix |
 |---|---|
 | `VPN ❌` on the board | No VPN interface on the **host**. Expected if you run none — chain still works |
-| `Leak check ❌` | Real IP == exit IP (circuit or curl anomaly). Press `1` to re-gate, `3` to rotate |
+| `Leak check ❌ BUSTED` | Real IP == exit IP (circuit or curl anomaly). Press `1` to re-gate, `3` to rotate |
+| `Leak check ❓ UNKNOWN` | IP lookup services unreachable — network flake, not a verdict. Press `4` to retry |
+| `ROTATION FAILED` in log/output | Control port 9051 dead or squatted by another process. Press `1` to re-engage (boots a clean Tor with control enabled) |
+| Rotator survived a network blip | By design — flakes warn and retry; only a confirmed leak kills it |
 | Engage takes ~10–30s | Leak gate retries on flaky networks — it's verifying, not hanging |
 | Port 9050 already in use | Existing Tor detected — the stack uses its own SocksPort/DataDirectory instead |
 | Second menu window quits, chain stays up | **By design** — ownership lock. The chain belongs to the window that engaged it |

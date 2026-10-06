@@ -1,5 +1,7 @@
 # runtime state — never push
 *.pid
+rotator.owner
+tor.session
 ip.cache
 stack.log
 *.log

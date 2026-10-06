@@ -79,12 +79,28 @@ vpn_state_plain() {
 }
 
 refresh_ips() {
-    local real exit_
-    real=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "?")
-    exit_=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 https://api.ipify.org 2>/dev/null || echo "?")
-    local verdict="CLEAN" color="$C_G"
-    if [[ "$real" == "$exit_" || "$exit_" == "?" ]]; then
-        verdict="BUSTED"; color="$C_R"
+    local real="" exit_="" u
+    for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+        real=$(curl -s --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
+        [[ "$real" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
+        real=""
+    done
+    for u in https://api.ipify.org https://ifconfig.me/ip https://check.torproject.org/api/ip; do
+        exit_=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 "$u" 2>/dev/null || true)
+        if [[ "$u" == *check.torproject* ]]; then
+            exit_=$(printf '%s' "$exit_" | sed -n 's/.*"IP"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+        exit_=$(printf '%s' "$exit_" | tr -d '[:space:]')
+        [[ "$exit_" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
+        exit_=""
+    done
+    local verdict="UNKNOWN" color="$C_C"
+    if [[ -n "$real" && -n "$exit_" ]]; then
+        if [[ "$real" == "$exit_" ]]; then
+            verdict="BUSTED"; color="$C_R"
+        else
+            verdict="CLEAN"; color="$C_G"
+        fi
     fi
     local egress
     egress=$(curl -s --max-time 8 "http://ip-api.com/json/?fields=country,isp,as" 2>/dev/null \
@@ -97,11 +113,12 @@ ip_field() { [[ -f "$IPF" ]] && cut -d'|' -f"$1" "$IPF" || echo "?"; }
 
 engage() {
     if rotator_live && [[ -n "$(tor_pid)" ]]; then
+        # chain already live — make sure close=off can still find our tor
+        [[ -f "$TORF" ]] || tor_pid > "$TORF" 2>/dev/null || true
         return 0
     fi
     printf '  %s[*]%s engaging chain — tor boot + leak gate...\n' "$C_Y" "$R"
-    local had_tor=0 attempt
-    [[ -n "$(tor_pid)" ]] && had_tor=1
+    local attempt
     for attempt in 1 2 3; do
         if "$DRV" start; then
             break
@@ -113,9 +130,7 @@ engage() {
         printf '  %s[*]%s gate hiccup — retrying (%s/3)...\n' "$C_Y" "$R" "$((attempt + 1))"
         sleep 3
     done
-    if [[ $had_tor -eq 0 ]]; then
-        tor_pid > "$TORF" 2>/dev/null || true
-    fi
+    tor_pid > "$TORF" 2>/dev/null || true
     AXIOM_ROTATE="$ROTATE_INTERVAL" "$DRV" watch >> "$BASE/stack.log" 2>&1 &
     echo $! > "$PIDF"
     echo $$ > "$OWNERF"
@@ -200,11 +215,11 @@ BANNER
     else
         printf '  %-14s: ❌ unknown\n' "Chain exit"
     fi
-    if [[ "$(ip_field 3)" == "CLEAN" ]]; then
-        printf '  %-14s: ✅ CLEAN\n' "Leak check"
-    else
-        printf '  %-14s: ❌ %sBUSTED%s\n' "Leak check" "$C_R" "$R"
-    fi
+    case "$(ip_field 3)" in
+        CLEAN)  printf '  %-14s: ✅ CLEAN\n' "Leak check" ;;
+        BUSTED) printf '  %-14s: ❌ %sBUSTED%s\n' "Leak check" "$C_R" "$R" ;;
+        *)      printf '  %-14s: ❓ UNKNOWN — press 4 to re-check\n' "Leak check" ;;
+    esac
     printf '  %s── MENU ────────────────────────────────────────────────────%s\n' "$C_D" "$R"
     printf '  %s1)%s Engage / re-check chain\n'        "$C_C" "$R"
     printf '  %s2)%s Disengage (stop chain)\n'         "$C_C" "$R"
@@ -218,11 +233,16 @@ BANNER
 }
 
 main() {
-    engage
-    draw
-    printf '  %s▶ auto: chained shell starting — type %sexit%s to come back here%s\n' \
-        "$C_G" "$C_B" "$C_G" "$R"
-    "$DRV" shell || true
+    if engage; then
+        draw
+        printf '  %s▶ auto: chained shell starting — type %sexit%s to come back here%s\n' \
+            "$C_G" "$C_B" "$C_G" "$R"
+        "$DRV" shell || true
+    else
+        draw
+        printf '  %s[!]%s chain NOT engaged — fix above, then press 1. menu stays open.\n' "$C_R" "$R"
+        sleep 3
+    fi
     while true; do
         draw
         read -rp $'  \e[35maxiom\e[0m ❯ ' choice || { disengage; exit 0; }

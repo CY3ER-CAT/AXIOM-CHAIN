@@ -45,38 +45,76 @@ start_tor() {
     log "Tor circuit confirmed. Fuck yeah."
 }
 
-rotate_circuit() {
-    log "Requesting fresh circuit..."
-    if command -v socat >/dev/null 2>&1; then
-        printf 'AUTHENTICATE ""\nsignal NEWNYM\nQUIT\n' \
-            | timeout 5 socat - "TCP:$TOR_CONTROL" >/dev/null 2>&1 || true
-    else
-        printf 'AUTHENTICATE ""\nsignal NEWNYM\nQUIT\n' \
-            | timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/9051; cat >&3; cat <&3" \
-            >/dev/null 2>&1 || true
-    fi
-    sleep 2
+is_ipv4() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+
+ip_direct() {
+    local u ip
+    for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+        ip=$(curl -s --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
+        is_ipv4 "$ip" && { echo "$ip"; return 0; }
+    done
+    return 1
 }
 
+ip_via_chain() {
+    local u raw ip
+    for u in https://api.ipify.org https://ifconfig.me/ip https://check.torproject.org/api/ip; do
+        raw=$(curl -s --max-time 20 --socks5-hostname "$TOR_SOCKS" "$u" 2>/dev/null || true)
+        if [[ "$u" == *check.torproject* ]]; then
+            raw=$(printf '%s' "$raw" | sed -n 's/.*"IP"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+        ip=$(printf '%s' "$raw" | tr -d '[:space:]')
+        is_ipv4 "$ip" && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+
+rotate_circuit() {
+    log "Requesting fresh circuit..."
+    local out=""
+    if command -v socat >/dev/null 2>&1; then
+        out=$(printf 'AUTHENTICATE ""\nsignal NEWNYM\nQUIT\n' \
+            | timeout 5 socat - "TCP:$TOR_CONTROL" 2>/dev/null || true)
+    else
+        out=$( { printf 'AUTHENTICATE ""\nsignal NEWNYM\nQUIT\n'; sleep 0.5; } \
+            | timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/9051; cat >&3; cat <&3" \
+            2>/dev/null || true)
+    fi
+    if printf '%s' "$out" | grep -q "250"; then
+        log "Circuit rotated — control port answered 250 OK."
+        sleep 2
+        return 0
+    fi
+    printf '[\e[31mAXIOM\e[0m] ROTATION FAILED — control port 9051 did not answer NEWNYM (dead or squatted). Check stack.log.\n' >&2
+    return 1
+}
+
+# exit codes: 0 = verified clean, 1 = confirmed leak (real == exit), 2 = could not verify
 leak_check() {
     log "Leak gate engaged..."
-    local real_ip exit_ip tries
+    local real_ip="" exit_ip="" tries
     for tries in 1 2 3; do
-        real_ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "?")
-        exit_ip=$(curl -s --max-time 20 --socks5-hostname "$TOR_SOCKS" https://api.ipify.org 2>/dev/null || echo "?")
-        [[ "$real_ip" != "?" && "$exit_ip" != "?" && -n "$real_ip" && -n "$exit_ip" ]] && break
+        real_ip=$(ip_direct 2>/dev/null || true)
+        exit_ip=$(ip_via_chain 2>/dev/null || true)
+        [[ -n "$real_ip" && -n "$exit_ip" ]] && break
         [[ $tries -lt 3 ]] && { log "Gate hiccup (attempt $tries) — retrying..."; sleep 3; }
     done
-    [[ "$real_ip" == "unknown" || "$real_ip" == "?" || -z "$real_ip" ]] && die "Can't resolve real IP, couldn't verify. Abort."
-    [[ "$exit_ip" == "?" || -z "$exit_ip" ]] && die "Exit IP unreachable through chain. Abort."
-    [[ "$real_ip" == "$exit_ip" ]] && die "BUSTED — exit == real. Chain is leaking, abort."
+    if [[ -z "$real_ip" || -z "$exit_ip" ]]; then
+        printf '[\e[31mAXIOM\e[0m] UNVERIFIED — could not confirm IPs this round (network flake, NOT a verdict).\n' >&2
+        return 2
+    fi
     log "Real : $real_ip"
     log "Exit : $exit_ip"
+    if [[ "$real_ip" == "$exit_ip" ]]; then
+        printf '[\e[31mAXIOM\e[0m] BUSTED — exit == real. Chain is leaking, abort.\n' >&2
+        return 1
+    fi
     log "Chain verified. That's what the hell is going on."
+    return 0
 }
 
 proxy_run() {
-    log "Chaining through VPN -> Tor -> hops: $*"
+    log "Running through the chain: $*"
     proxychains4 -f "$CHAIN_CONF" -q "$@"
 }
 
@@ -89,13 +127,20 @@ rotator_loop() {
         exit 0
     }
     trap _rotator_cleanup INT TERM HUP
+    local rc
     while true; do
         sleep "$ROTATE_INTERVAL" &
         _sleep_pid=$!
         wait "$_sleep_pid" 2>/dev/null || true
         _sleep_pid=""
-        rotate_circuit
-        leak_check || die "Leak detected mid-run, shutting down."
+        rotate_circuit || log "Rotation signal failed — will retry next cycle."
+        rc=0
+        leak_check || rc=$?
+        if [[ $rc -eq 1 ]]; then
+            die "Leak detected mid-run (real == exit), shutting down."
+        elif [[ $rc -eq 2 ]]; then
+            log "Couldn't verify this round — staying up, re-checking next cycle."
+        fi
     done
 }
 
@@ -113,7 +158,7 @@ EOF
 
 case "${1:-}" in
     start)  check_vpn; start_tor; leak_check ;;
-    rotate) rotate_circuit; leak_check ;;
+    rotate) rotate_circuit || log "Continuing — verifying circuit anyway..."; leak_check ;;
     watch)  rotator_loop ;;
     run)    shift; check_vpn; start_tor; proxy_run "$@" ;;
     shell)  check_vpn; start_tor; proxy_run "${SHELL:-/bin/bash}" ;;
